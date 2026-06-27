@@ -1,0 +1,249 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Task Queue Dashboard</title>
+  <script src="https://unpkg.com/react@18/umd/react.development.js"></script>
+<script src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
+<script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+<script src="https://cdn.tailwindcss.com"></script>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4/dist/chart.umd.min.js"></script>
+  <style>
+    body { font-family: ui-sans-serif, system-ui, sans-serif; }
+  </style>
+</head>
+<body class="bg-gray-950 text-gray-100 min-h-screen p-6">
+  <div id="root"></div>
+
+  <script type="text/babel">
+    const { useState, useEffect, useRef, useCallback } = React;
+
+    const WS_URL  = 'ws://localhost:8000/ws/metrics';
+    const API_URL = 'http://localhost:8000';
+    const MAX_HISTORY = 30;
+
+    /* ── tiny stat card ── */
+    function Card({ label, value, unit, accent }) {
+      return (
+        <div className="bg-gray-800 rounded-xl p-4 flex flex-col gap-1 border border-gray-700">
+          <span className="text-xs text-gray-400 uppercase tracking-wide">{label}</span>
+          <div className="flex items-baseline gap-1">
+            <span className={`text-3xl font-semibold tabular-nums ${accent ?? 'text-white'}`}>{value}</span>
+            {unit && <span className="text-sm text-gray-500">{unit}</span>}
+          </div>
+        </div>
+      );
+    }
+
+    /* ── main app ── */
+    function App() {
+      const [metrics, setMetrics]   = useState(null);
+      const [status, setStatus]     = useState('connecting'); // connecting | live | reconnecting
+      const [history, setHistory]   = useState([]);           // [{label, v}]
+
+      const [taskName,  setTaskName]  = useState('');
+      const [priority,  setPriority]  = useState('2');
+      const [submitMsg, setSubmitMsg] = useState(null); // {ok, text}
+
+      const chartCanvas  = useRef(null);
+      const chartInst    = useRef(null);
+      const wsRef        = useRef(null);
+      const reconnTimer  = useRef(null);
+
+      /* ── WebSocket with auto-reconnect ── */
+      const connect = useCallback(() => {
+        setStatus('connecting');
+        const ws = new WebSocket(WS_URL);
+        wsRef.current = ws;
+
+        ws.onopen = () => setStatus('live');
+
+        ws.onmessage = (e) => {
+          const data = JSON.parse(e.data);
+          setMetrics(data);
+          setHistory(prev => {
+            const ts = new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' });
+            const next = [...prev, { label: ts, v: data.throughput_per_sec }];
+            return next.length > MAX_HISTORY ? next.slice(-MAX_HISTORY) : next;
+          });
+        };
+
+        ws.onclose = () => {
+          setStatus('reconnecting');
+          reconnTimer.current = setTimeout(connect, 2000);
+        };
+
+        ws.onerror = () => ws.close();
+      }, []);
+
+      useEffect(() => {
+        connect();
+        return () => {
+          clearTimeout(reconnTimer.current);
+          wsRef.current?.close();
+        };
+      }, [connect]);
+
+      /* ── Chart init ── */
+      useEffect(() => {
+        if (!chartCanvas.current) return;
+        chartInst.current = new Chart(chartCanvas.current, {
+          type: 'line',
+          data: {
+            labels: [],
+            datasets: [{
+              label: 'jobs/sec',
+              data: [],
+              borderColor: '#818cf8',
+              backgroundColor: 'rgba(129,140,248,0.12)',
+              borderWidth: 2,
+              pointRadius: 2,
+              fill: true,
+              tension: 0.35,
+            }],
+          },
+          options: {
+            animation: false,
+            responsive: true,
+            maintainAspectRatio: false,
+            interaction: { mode: 'index', intersect: false },
+            scales: {
+              x: {
+                ticks: { color: '#6b7280', maxTicksLimit: 8, font: { size: 11 } },
+                grid:  { color: '#1f2937' },
+              },
+              y: {
+                beginAtZero: true,
+                ticks: { color: '#6b7280', font: { size: 11 } },
+                grid:  { color: '#1f2937' },
+              },
+            },
+            plugins: {
+              legend: { labels: { color: '#9ca3af', font: { size: 12 } } },
+              tooltip: { callbacks: { label: ctx => ` ${ctx.parsed.y.toFixed(1)} jobs/sec` } },
+            },
+          },
+        });
+        return () => chartInst.current?.destroy();
+      }, []);
+
+      /* ── Push history into chart ── */
+      useEffect(() => {
+        const c = chartInst.current;
+        if (!c) return;
+        c.data.labels                    = history.map(h => h.label);
+        c.data.datasets[0].data          = history.map(h => h.v);
+        c.update('none');
+      }, [history]);
+
+      /* ── Submit form ── */
+      async function handleSubmit(e) {
+        e.preventDefault();
+        if (!taskName.trim()) return;
+        try {
+          const res = await fetch(`${API_URL}/submit`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ task_name: taskName.trim(), priority: Number(priority), payload: {} }),
+          });
+          if (!res.ok) throw new Error(res.statusText);
+          const data = await res.json();
+          setSubmitMsg({ ok: true, text: `Queued — job id: ${data.job_id}` });
+          setTaskName('');
+        } catch (err) {
+          setSubmitMsg({ ok: false, text: `Error: ${err.message}` });
+        }
+        setTimeout(() => setSubmitMsg(null), 4000);
+      }
+
+      const fmt = (v, dp = 1) => v != null ? v.toFixed(dp) : '—';
+      const fmtInt = (v) => v != null ? v.toLocaleString() : '—';
+
+      const statusColors = {
+        live:         'bg-emerald-900 text-emerald-300',
+        connecting:   'bg-yellow-900  text-yellow-300',
+        reconnecting: 'bg-red-900     text-red-300',
+      };
+
+      return (
+        <div className="max-w-5xl mx-auto space-y-6">
+
+          {/* header */}
+          <div className="flex items-center justify-between">
+            <h1 className="text-xl font-bold tracking-tight">Task Queue Dashboard</h1>
+            <span className={`px-3 py-1 rounded-full text-xs font-semibold ${statusColors[status]}`}>
+              {status === 'live' ? '● Live' : status === 'connecting' ? '◌ Connecting…' : '● Reconnecting…'}
+            </span>
+          </div>
+
+          {/* metric cards */}
+          <div className="grid grid-cols-2 sm:grid-cols-3 gap-4">
+            <Card label="Throughput"     value={fmt(metrics?.throughput_per_sec)} unit="jobs/s" accent="text-indigo-400" />
+            <Card label="Avg Latency"    value={fmt(metrics?.avg_latency_ms)}     unit="ms" />
+            <Card label="Completed"      value={fmtInt(metrics?.jobs_completed)} />
+            <Card label="Dead Jobs"      value={fmtInt(metrics?.jobs_dead)}       accent={metrics?.jobs_dead > 0 ? 'text-red-400' : undefined} />
+            <Card label="Queue Size"     value={fmtInt(metrics?.queue_size)} />
+            <Card label="Active Workers" value={fmtInt(metrics?.active_workers)} />
+          </div>
+
+          {/* throughput chart */}
+          <div className="bg-gray-800 rounded-xl border border-gray-700 p-4">
+            <p className="text-xs text-gray-400 uppercase tracking-wide mb-3">Throughput — last 30 s</p>
+            <div style={{ height: '180px', position: 'relative' }}>
+              <canvas ref={chartCanvas} />
+            </div>
+          </div>
+
+          {/* submit form */}
+          <div className="bg-gray-800 rounded-xl border border-gray-700 p-4">
+            <p className="text-xs text-gray-400 uppercase tracking-wide mb-3">Submit Job</p>
+            <form onSubmit={handleSubmit} className="flex flex-wrap gap-3 items-end">
+              <div className="flex-1 min-w-48">
+                <label className="block text-xs text-gray-500 mb-1">Task Name</label>
+                <input
+                  type="text"
+                  value={taskName}
+                  onChange={e => setTaskName(e.target.value)}
+                  placeholder="e.g. send_email"
+                  required
+                  className="w-full bg-gray-700 border border-gray-600 rounded-lg px-3 py-2 text-sm
+                             focus:outline-none focus:ring-2 focus:ring-indigo-500 placeholder-gray-500"
+                />
+              </div>
+              <div>
+                <label className="block text-xs text-gray-500 mb-1">Priority</label>
+                <select
+                  value={priority}
+                  onChange={e => setPriority(e.target.value)}
+                  className="bg-gray-700 border border-gray-600 rounded-lg px-3 py-2 text-sm
+                             focus:outline-none focus:ring-2 focus:ring-indigo-500"
+                >
+                  <option value="1">1 — High</option>
+                  <option value="2">2 — Normal</option>
+                  <option value="3">3 — Low</option>
+                </select>
+              </div>
+              <button
+                type="submit"
+                className="bg-indigo-600 hover:bg-indigo-500 active:bg-indigo-700
+                           px-5 py-2 rounded-lg text-sm font-medium transition-colors"
+              >
+                Submit
+              </button>
+            </form>
+            {submitMsg && (
+              <p className={`mt-2 text-xs ${submitMsg.ok ? 'text-emerald-400' : 'text-red-400'}`}>
+                {submitMsg.text}
+              </p>
+            )}
+          </div>
+
+        </div>
+      );
+    }
+
+    ReactDOM.createRoot(document.getElementById('root')).render(<App />);
+  </script>
+</body>
+</html>
